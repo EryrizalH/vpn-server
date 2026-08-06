@@ -40,7 +40,7 @@ except ImportError:
 
 console = Console()
 
-SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+SCRIPT_DIR = os.path.dirname(os.path.realpath(__file__))
 
 def load_env_file(filepath: str):
     """Simple parser to load key=value from .env file into os.environ if present."""
