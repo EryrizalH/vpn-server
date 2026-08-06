@@ -1,0 +1,10 @@
+/var/log/ppp.log {
+    weekly
+    rotate 4
+    size 20M
+    compress
+    delaycompress
+    missingok
+    notifempty
+    copytruncate
+}

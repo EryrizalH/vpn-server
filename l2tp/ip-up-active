@@ -1,0 +1,11 @@
+#!/bin/bash
+INTERFACE="$1"
+REMOTE_IP="$5"
+USERNAME="${PEERNAME:-${6:-$USER}}"
+TIMESTAMP=$(date +%s)
+
+env > /tmp/ip_up_env.txt
+
+mkdir -p /var/run
+sed -i "/^${INTERFACE}|/d" /var/run/active_ppp_users.txt 2>/dev/null || true
+echo "${INTERFACE}|${USERNAME}|${REMOTE_IP}|${TIMESTAMP}" >> /var/run/active_ppp_users.txt

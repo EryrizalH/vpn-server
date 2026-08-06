@@ -1,0 +1,3 @@
+#!/bin/bash
+INTERFACE="$1"
+sed -i "/^${INTERFACE}|/d" /var/run/active_ppp_users.txt 2>/dev/null || true

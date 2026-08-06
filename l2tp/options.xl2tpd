@@ -1,0 +1,19 @@
+name l2tpd
+debug
+logfile /var/log/ppp.log
+asyncmap 0
+auth
+crtscts
+lock
+hide-password
+modem
+mru 1400
+mtu 1400
+proxyarp
+lcp-echo-interval 30
+lcp-echo-failure 4
+plugin radius.so
+radius-config-file /etc/radiusclient/radiusclient.conf
+
+ms-dns 8.8.8.8
+ms-dns 8.8.4.4

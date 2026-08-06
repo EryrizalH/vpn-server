@@ -1,0 +1,14 @@
+#
+# TTY to NAS-Port mapping file
+#
+pts/0 0
+pts/1 1
+pts/2 2
+pts/3 3
+pts/4 4
+pts/5 5
+pts/6 6
+pts/7 7
+pts/8 8
+pts/9 9
+pts/10 10
