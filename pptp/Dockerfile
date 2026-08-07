@@ -20,10 +20,12 @@ COPY dictionary /etc/radiusclient/dictionary
 COPY port-id-map /etc/radiusclient/port-id-map
 COPY ip-up-active /etc/ppp/ip-up.d/active_user
 COPY ip-down-active /etc/ppp/ip-down.d/active_user
+COPY ip-up-shaping /etc/ppp/ip-up.d/shaping
+COPY ip-down-shaping /etc/ppp/ip-down.d/shaping
 COPY logrotate-ppp /etc/logrotate.d/ppp
 COPY entrypoint.sh /entrypoint.sh
 
-RUN chmod +x /entrypoint.sh /etc/ppp/ip-up.d/active_user /etc/ppp/ip-down.d/active_user && chmod 600 /etc/radiusclient/servers /etc/logrotate.d/ppp
+RUN chmod +x /entrypoint.sh /etc/ppp/ip-up.d/* /etc/ppp/ip-down.d/* && chmod 600 /etc/radiusclient/servers /etc/logrotate.d/ppp
 
 EXPOSE 1723/tcp
 

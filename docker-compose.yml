@@ -8,6 +8,8 @@ services:
       - NET_ADMIN
     devices:
       - /dev/ppp:/dev/ppp
+    volumes:
+      - ./bandwidth_limits.conf:/etc/ppp/bandwidth_limits.conf:ro
 
   l2tp-vpn:
     build: ./l2tp
@@ -19,3 +21,6 @@ services:
       - SYS_ADMIN
     devices:
       - /dev/ppp:/dev/ppp
+    volumes:
+      - ./bandwidth_limits.conf:/etc/ppp/bandwidth_limits.conf:ro
+

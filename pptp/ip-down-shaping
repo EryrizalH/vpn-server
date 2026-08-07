@@ -1,0 +1,4 @@
+#!/bin/bash
+INTERFACE="$1"
+tc qdisc del dev "$INTERFACE" root 2>/dev/null || true
+tc qdisc del dev "$INTERFACE" ingress 2>/dev/null || true

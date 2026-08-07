@@ -1,0 +1,49 @@
+#!/bin/bash
+INTERFACE="$1"
+REMOTE_IP="$5"
+USERNAME="${PEERNAME:-${6:-$USER}}"
+CONFIG_FILE="/etc/ppp/bandwidth_limits.conf"
+
+DEFAULT_LIMIT="20mbit/20mbit"
+
+if [ -f "$CONFIG_FILE" ]; then
+    DEF_TMP=$(grep -E "^DEFAULT_LIMIT=" "$CONFIG_FILE" | cut -d'=' -f2 | tr -d ' "\r\n')
+    [ -n "$DEF_TMP" ] && DEFAULT_LIMIT="$DEF_TMP"
+    
+    CUSTOM_LIMIT=""
+    if [ -n "$USERNAME" ]; then
+        CUSTOM_LIMIT=$(grep -E "^${USERNAME}=" "$CONFIG_FILE" | head -n 1 | cut -d'=' -f2 | tr -d ' "\r\n')
+    fi
+    if [ -z "$CUSTOM_LIMIT" ] && [ -n "$REMOTE_IP" ]; then
+        CUSTOM_LIMIT=$(grep -E "^${REMOTE_IP}=" "$CONFIG_FILE" | head -n 1 | cut -d'=' -f2 | tr -d ' "\r\n')
+    fi
+    [ -n "$CUSTOM_LIMIT" ] && LIMIT="$CUSTOM_LIMIT" || LIMIT="$DEFAULT_LIMIT"
+else
+    LIMIT="$DEFAULT_LIMIT"
+fi
+
+if [ "$LIMIT" = "unlimited" ] || [ "$LIMIT" = "0" ] || [ "$LIMIT" = "off" ]; then
+    tc qdisc del dev "$INTERFACE" root 2>/dev/null || true
+    tc qdisc del dev "$INTERFACE" ingress 2>/dev/null || true
+    exit 0
+fi
+
+if [[ "$LIMIT" == *"/"* ]]; then
+    DOWN_RATE="${LIMIT%/*}"
+    UP_RATE="${LIMIT#*/}"
+else
+    DOWN_RATE="$LIMIT"
+    UP_RATE="$LIMIT"
+fi
+
+tc qdisc del dev "$INTERFACE" root 2>/dev/null || true
+tc qdisc del dev "$INTERFACE" ingress 2>/dev/null || true
+
+if [ -n "$DOWN_RATE" ] && [ "$DOWN_RATE" != "unlimited" ]; then
+    tc qdisc add dev "$INTERFACE" root tbf rate "$DOWN_RATE" burst 256k latency 50ms 2>/dev/null || true
+fi
+
+if [ -n "$UP_RATE" ] && [ "$UP_RATE" != "unlimited" ]; then
+    tc qdisc add dev "$INTERFACE" handle ffff: ingress 2>/dev/null || true
+    tc filter add dev "$INTERFACE" parent ffff: protocol ip u32 match u32 0 0 action police rate "$UP_RATE" burst 256k drop 2>/dev/null || true
+fi
