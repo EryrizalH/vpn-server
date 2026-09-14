@@ -21,7 +21,9 @@ fi
 
 chmod 755 /usr/sbin/pppd 2>/dev/null || true
 
-mkdir -p /var/run/xl2tpd
+mkdir -p /var/run/xl2tpd /var/run/vpn
+touch /var/run/vpn/active_ppp_users.txt
+ln -sf /var/run/vpn/active_ppp_users.txt /var/run/active_ppp_users.txt 2>/dev/null || true
 echo "0" > /var/run/radius.seq
 chmod 666 /var/run/radius.seq
 

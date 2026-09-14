@@ -3,9 +3,46 @@ INTERFACE="$1"
 REMOTE_IP="$5"
 USERNAME="${PEERNAME:-${6:-$USER}}"
 TIMESTAMP=$(date +%s)
+PID="$PPID"
+PROTO="L2TP"
 
-env > /tmp/ip_up_env.txt
+RUN_DIR="/var/run/vpn"
+mkdir -p "$RUN_DIR" 2>/dev/null || true
+ACTIVE_FILE="$RUN_DIR/active_ppp_users.txt"
+LOG_FILE="$RUN_DIR/vpn-watchdog.log"
+touch "$ACTIVE_FILE" 2>/dev/null || true
 
-mkdir -p /var/run
-sed -i "/^${INTERFACE}|/d" /var/run/active_ppp_users.txt 2>/dev/null || true
-echo "${INTERFACE}|${USERNAME}|${REMOTE_IP}|${TIMESTAMP}" >> /var/run/active_ppp_users.txt
+# ponytail: Kick older duplicate sessions for the same user immediately upon reconnect
+if [ -n "$USERNAME" ] && [ -f "$ACTIVE_FILE" ]; then
+    while IFS="|" read -r old_iface old_user old_ip old_time old_pid old_proto; do
+        if [ "$old_user" = "$USERNAME" ] && [ "$old_iface" != "$INTERFACE" ]; then
+            if [ -n "$old_pid" ] && [ "$old_pid" != "-" ]; then
+                kill -TERM "$old_pid" 2>/dev/null || true
+                (sleep 2 && kill -9 "$old_pid" 2>/dev/null) &
+            fi
+            pkill -f "$old_iface" 2>/dev/null || true
+            sed -i "/^${old_iface}|/d" "$ACTIVE_FILE" 2>/dev/null || true
+            if [ -w /var/run/active_ppp_users.txt ]; then
+                sed -i "/^${old_iface}|/d" /var/run/active_ppp_users.txt 2>/dev/null || true
+            fi
+            LOG_LINE="$(date '+%Y-%m-%d %H:%M:%S') [KICK-ON-CONNECT] User '$USERNAME' reconnected on $INTERFACE ($REMOTE_IP, Proto: $PROTO). Kicked old session on $old_iface ($old_ip, PID: ${old_pid:--}, Proto: ${old_proto:-Unknown})."
+            echo "$LOG_LINE" >> "$LOG_FILE" 2>/dev/null || true
+            if [ -w /var/log/vpn-watchdog.log ]; then
+                echo "$LOG_LINE" >> /var/log/vpn-watchdog.log 2>/dev/null || true
+            fi
+        fi
+    done < "$ACTIVE_FILE"
+fi
+
+# Clean up any previous record for this interface
+sed -i "/^${INTERFACE}|/d" "$ACTIVE_FILE" 2>/dev/null || true
+if [ -w /var/run/active_ppp_users.txt ]; then
+    sed -i "/^${INTERFACE}|/d" /var/run/active_ppp_users.txt 2>/dev/null || true
+fi
+
+# Register current active session: INTERFACE|USERNAME|REMOTE_IP|TIMESTAMP|PID|PROTO
+ENTRY="${INTERFACE}|${USERNAME}|${REMOTE_IP}|${TIMESTAMP}|${PID}|${PROTO}"
+echo "$ENTRY" >> "$ACTIVE_FILE" 2>/dev/null || true
+if [ -w /var/run/active_ppp_users.txt ]; then
+    echo "$ENTRY" >> /var/run/active_ppp_users.txt 2>/dev/null || true
+fi

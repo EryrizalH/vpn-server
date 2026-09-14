@@ -4,18 +4,21 @@ services:
     container_name: pptp-server
     restart: always
     network_mode: host
+    pid: host
     cap_add:
       - NET_ADMIN
     devices:
       - /dev/ppp:/dev/ppp
     volumes:
       - ./bandwidth_limits.conf:/etc/ppp/bandwidth_limits.conf:ro
+      - ./run:/var/run/vpn
 
   l2tp-vpn:
     build: ./l2tp
     container_name: l2tp-server
     restart: always
     network_mode: host
+    pid: host
     cap_add:
       - NET_ADMIN
       - SYS_ADMIN
@@ -23,4 +26,5 @@ services:
       - /dev/ppp:/dev/ppp
     volumes:
       - ./bandwidth_limits.conf:/etc/ppp/bandwidth_limits.conf:ro
+      - ./run:/var/run/vpn
 

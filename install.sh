@@ -178,7 +178,14 @@ EOF
     chmod 600 "$target_dir/l2tp/servers" "$target_dir/pptp/servers"
     chmod +x "$target_dir/vpn_cli.py"
 
-    echo -e "${GREEN}[✔] Konfigurasi RADIUS berhasil dibuat.${NC}"
+    # Setup shared runtime directory for active sessions & auto-kick watchdog
+    mkdir -p "$target_dir/run"
+    touch "$target_dir/run/active_ppp_users.txt" "$target_dir/run/vpn-watchdog.log"
+    chmod -R 777 "$target_dir/run"
+    rm -f /var/log/vpn-watchdog.log
+    ln -sf "$target_dir/run/vpn-watchdog.log" /var/log/vpn-watchdog.log
+
+    echo -e "${GREEN}[✔] Konfigurasi RADIUS & runtime directory berhasil dibuat.${NC}"
 }
 
 # Function: Start Docker Containers
@@ -203,6 +210,35 @@ setup_cli() {
     chmod +x /usr/local/bin/vpn-cli
 
     echo -e "${GREEN}[✔] CLI 'vpn-cli' berhasil di-link ke /usr/local/bin/vpn-cli.${NC}"
+}
+
+# Function: Setup Auto-Kick Watchdog Systemd Service
+setup_watchdog_service() {
+    local target_dir="$1"
+    echo -e "\n${YELLOW}[*] Menyiapkan Systemd Service Auto-Kick Watchdog (vpn-watchdog.service)...${NC}"
+
+    cat <<EOF > /etc/systemd/system/vpn-watchdog.service
+[Unit]
+Description=VPN Duplicate & Stuck Session Auto-Kick Watchdog
+After=docker.service
+Requires=docker.service
+
+[Service]
+Type=simple
+WorkingDirectory=$target_dir
+ExecStart=/usr/local/bin/vpn-cli watchdog --interval 10
+Restart=always
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+    systemctl daemon-reload
+    systemctl enable --now vpn-watchdog.service 2>/dev/null || true
+    echo -e "${GREEN}[✔] Service 'vpn-watchdog.service' berhasil diaktifkan & berjalan otomatis di background.${NC}"
 }
 
 # Function: Interactive Installation Wizard
@@ -247,15 +283,17 @@ run_installation() {
     deploy_files "$INSTALL_DIR" "$RADIUS_IP" "$RADIUS_SECRET"
     start_containers "$INSTALL_DIR"
     setup_cli "$INSTALL_DIR"
+    setup_watchdog_service "$INSTALL_DIR"
 
     echo -e "\n${GREEN}${BOLD}=================================================================${NC}"
     echo -e "${GREEN}${BOLD}   🎉 INSTALASI VPN SERVER BERHASIL DISELESAIKAN!               ${NC}"
     echo -e "${GREEN}${BOLD}=================================================================${NC}"
     echo -e "Untuk mengelola VPN Server, jalankan perintah:${NC}"
-    echo -e "   ${CYAN}vpn-cli${NC}        (Menu Interaktif TUI)"
-    echo -e "   ${CYAN}vpn-cli status${NC} (Melihat Dashboard Connection Status)"
-    echo -e "   ${CYAN}vpn-cli users${NC}  (Melihat User VPN Aktif)"
-    echo -e "   ${CYAN}vpn-cli diag${NC}   (Menjalankan Pengujian Diagnostik RADIUS)"
+    echo -e "   ${CYAN}vpn-cli${NC}                  (Menu Interaktif TUI)"
+    echo -e "   ${CYAN}vpn-cli status${NC}           (Melihat Dashboard Connection & Watchdog Status)"
+    echo -e "   ${CYAN}vpn-cli users${NC}            (Melihat User VPN Aktif)"
+    echo -e "   ${CYAN}vpn-cli logs -s watchdog${NC} (Melihat Log Auto-Kick Watchdog)"
+    echo -e "   ${CYAN}vpn-cli diag${NC}             (Menjalankan Pengujian Diagnostik RADIUS)"
     echo ""
 }
 
@@ -270,7 +308,8 @@ rebuild_containers() {
     echo -e "${YELLOW}[*] Melakukan Update & Rebuild Container Docker...${NC}"
     cd "$target_dir"
     docker compose up -d --build
-    echo -e "${GREEN}[✔] Rebuild selesai! Container telah diperbarui.${NC}"
+    setup_watchdog_service "$target_dir"
+    echo -e "${GREEN}[✔] Rebuild selesai! Container & Watchdog telah diperbarui dan berjalan otomatis di background.${NC}"
 }
 
 # Function: Uninstall VPN Server
@@ -284,6 +323,13 @@ uninstall_vpn() {
             cd "$target_dir" && docker compose down -v --rmi all 2>/dev/null || true
         fi
         
+        echo -e "${YELLOW}[*] Menghentikan dan menghapus watchdog service...${NC}"
+        systemctl stop vpn-watchdog.service 2>/dev/null || true
+        systemctl disable vpn-watchdog.service 2>/dev/null || true
+        rm -f /etc/systemd/system/vpn-watchdog.service
+        rm -f /var/log/vpn-watchdog.log
+        systemctl daemon-reload 2>/dev/null || true
+
         echo -e "${YELLOW}[*] Menghapus symlink CLI & file instalasi...${NC}"
         rm -f /usr/local/bin/vpn-cli
         rm -rf "$target_dir"

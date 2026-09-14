@@ -15,7 +15,7 @@ import argparse
 import select
 import tty
 import termios
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, Tuple
 
 import ipaddress
 
@@ -63,6 +63,11 @@ load_env_file(os.path.join(SCRIPT_DIR, ".env"))
 VPN_DIR = os.environ.get("VPN_DIR", SCRIPT_DIR)
 RADIUS_SERVER = os.environ.get("RADIUS_SERVER", "127.0.0.1")
 RADIUS_SECRET = os.environ.get("RADIUS_SECRET", "testing123")
+
+WATCHDOG_LOG_FILE = "/var/log/vpn-watchdog.log"
+LOCAL_RUN_DIR = os.path.join(VPN_DIR, "run")
+LOCAL_ACTIVE_FILE = os.path.join(LOCAL_RUN_DIR, "active_ppp_users.txt")
+LOCAL_WATCHDOG_LOG = os.path.join(LOCAL_RUN_DIR, "vpn-watchdog.log")
 
 def get_ip_sort_key(session: Dict[str, Any]):
     """Return ipaddress object for numerical IP sorting."""
@@ -161,40 +166,59 @@ def apply_all_rate_limits_live() -> int:
     return count
 
 def get_active_sessions() -> List[Dict[str, Any]]:
-    """Parse active PPP sessions from docker containers using active_ppp_users.txt & active interfaces."""
+    """Parse active PPP sessions from shared run file or docker containers."""
     sessions = []
+    seen_interfaces = set()
 
-    containers = [
-        ("L2TP", "l2tp-server"),
-        ("PPTP", "pptp-server")
-    ]
+    # Map current active ppp interfaces directly from host or containers
+    ip_out = run_cmd("ip addr 2>/dev/null")
+    if not ip_out or "ppp" not in ip_out:
+        ip_out = run_docker_cmd("docker exec l2tp-server ip addr 2>/dev/null") or ""
 
-    for proto, container_name in containers:
-        active_txt = run_docker_cmd(f"docker exec {container_name} cat /var/run/active_ppp_users.txt 2>/dev/null")
-        ps_out = run_docker_cmd(f"docker exec {container_name} ps aux 2>/dev/null")
-        ip_out = run_docker_cmd(f"docker exec {container_name} ip addr 2>/dev/null")
+    ip_map = {}  # interface -> ip
+    for line in ip_out.splitlines():
+        if "peer" in line:
+            dev_m = re.search(r"scope global (ppp\d+)", line)
+            peer_m = re.search(r"peer ([\d\.]+)", line)
+            if dev_m and peer_m:
+                ip_map[dev_m.group(1)] = peer_m.group(1)
 
-        # Map current active ppp interfaces in this container
-        ip_map = {} # interface -> ip
-        for line in ip_out.splitlines():
-            if "peer" in line:
-                dev_m = re.search(r"scope global (ppp\d+)", line)
-                peer_m = re.search(r"peer ([\d\.]+)", line)
-                if dev_m and peer_m:
-                    ip_map[dev_m.group(1)] = peer_m.group(1)
+    ps_out = run_cmd("ps aux 2>/dev/null")
 
-        if active_txt:
-            # Parse lines format: INTERFACE|USERNAME|REMOTE_IP|TIMESTAMP
-            for line in active_txt.splitlines():
-                parts = line.strip().split("|")
-                if len(parts) >= 3:
-                    interface, username, ip = parts[0], parts[1], parts[2]
-                    
-                    # Verify interface is currently UP
-                    if interface in ip_map:
-                        actual_ip = ip_map[interface]
-                        
-                        pid = "-"
+    # Collect active users text from shared local file or containers
+    active_sources = []
+    if os.path.exists(LOCAL_ACTIVE_FILE):
+        try:
+            with open(LOCAL_ACTIVE_FILE, "r") as f:
+                content = f.read().strip()
+                if content:
+                    active_sources.append(("LOCAL", content))
+        except Exception:
+            pass
+
+    if not active_sources:
+        for proto, cname in [("L2TP", "l2tp-server"), ("PPTP", "pptp-server")]:
+            txt = run_docker_cmd(f"docker exec {cname} cat /var/run/active_ppp_users.txt 2>/dev/null")
+            if txt:
+                active_sources.append((proto, txt))
+
+    for src_proto, active_txt in active_sources:
+        for line in active_txt.splitlines():
+            # Format: INTERFACE|USERNAME|REMOTE_IP|TIMESTAMP|PID|PROTO
+            parts = line.strip().split("|")
+            if len(parts) >= 3:
+                interface, username, ip = parts[0], parts[1], parts[2]
+                if interface in seen_interfaces:
+                    continue
+
+                if interface in ip_map:
+                    actual_ip = ip_map[interface]
+                    timestamp = int(parts[3]) if len(parts) > 3 and parts[3].isdigit() else 0
+                    recorded_pid = parts[4].strip() if len(parts) > 4 and parts[4].strip() else "-"
+                    detected_proto = parts[5].strip() if len(parts) > 5 and parts[5].strip() else (src_proto if src_proto != "LOCAL" else "L2TP")
+
+                    pid = recorded_pid if recorded_pid != "-" else "-"
+                    if pid == "-":
                         for ps_line in ps_out.splitlines():
                             if interface in ps_line:
                                 ps_parts = ps_line.split()
@@ -202,42 +226,43 @@ def get_active_sessions() -> List[Dict[str, Any]]:
                                     pid = ps_parts[1]
                                     break
 
-                        sessions.append({
-                            "protocol": proto,
-                            "container": container_name,
-                            "username": username,
-                            "ip": actual_ip,
-                            "interface": interface,
-                            "pid": pid,
-                            "status": "Active"
-                        })
-        else:
-            # Fallback if active_ppp_users.txt is not yet populated
-            log_out = run_docker_cmd(f"docker exec {container_name} cat /var/log/ppp.log 2>/dev/null")
-            if log_out:
-                for interface, ip in ip_map.items():
-                    matches = re.findall(rf"Connect: {interface} <-->.*?\n.*?rcvd \[CHAP Response [^\]]+, name = \"([^\"]+)\"\]", log_out, re.DOTALL)
-                    username = matches[-1] if matches else "Unknown"
-                    
-                    pid = "-"
-                    for ps_line in ps_out.splitlines():
-                        if interface in ps_line:
-                            ps_parts = ps_line.split()
-                            if len(ps_parts) > 1:
-                                pid = ps_parts[1]
-                                break
+                    container_name = "l2tp-server" if detected_proto.upper() == "L2TP" else "pptp-server"
 
                     sessions.append({
-                        "protocol": proto,
+                        "protocol": detected_proto.upper(),
                         "container": container_name,
+                        "username": username,
+                        "ip": actual_ip,
+                        "interface": interface,
+                        "pid": pid,
+                        "timestamp": timestamp,
+                        "status": "Active"
+                    })
+                    seen_interfaces.add(interface)
+
+    # Fallback if active text didn't catch an active interface
+    for interface, ip in ip_map.items():
+        if interface not in seen_interfaces:
+            for proto, cname in [("L2TP", "l2tp-server"), ("PPTP", "pptp-server")]:
+                log_out = run_docker_cmd(f"docker exec {cname} cat /var/log/ppp.log 2>/dev/null")
+                if log_out and interface in log_out:
+                    matches = re.findall(rf"Connect: {interface} <-->.*?\n.*?rcvd \[CHAP Response [^\]]+, name = \"([^\"]+)\"\]", log_out, re.DOTALL)
+                    username = matches[-1] if matches else "Unknown"
+                    sessions.append({
+                        "protocol": proto,
+                        "container": cname,
                         "username": username,
                         "ip": ip,
                         "interface": interface,
-                        "pid": pid,
+                        "pid": "-",
+                        "timestamp": 0,
                         "status": "Active"
                     })
+                    seen_interfaces.add(interface)
+                    break
 
     return sessions
+
 
 def print_status_dashboard():
     """Display overall VPN server health & connection status."""
@@ -260,6 +285,16 @@ def print_status_dashboard():
 
     stat_table.add_row("Server Host", run_cmd("hostname"))
     stat_table.add_row("FreeRADIUS IP", RADIUS_SERVER)
+    
+    watchdog_check = run_cmd("systemctl is-active vpn-watchdog.service 2>/dev/null")
+    if watchdog_check == "active":
+        watchdog_status = "[bold green]Active (Running)[/bold green]"
+    elif watchdog_check == "inactive":
+        watchdog_status = "[yellow]Inactive[/yellow]"
+    else:
+        watchdog_status = "[dim]Not installed / Standalone[/dim]"
+    stat_table.add_row("Auto-Kick Watchdog", watchdog_status)
+
     stat_table.add_row("Total Active VPN Users", f"[bold green]{total_count}[/bold green]")
     stat_table.add_row("  - Active L2TP Users", str(l2tp_count))
     stat_table.add_row("  - Active PPTP Users", str(pptp_count))
@@ -508,24 +543,178 @@ def print_active_users_table(filter_keyword: Optional[str] = None, interval: flo
     finally:
         console.print("\n[yellow]Monitoring realtime dihentikan.[/yellow]")
 
+def log_watchdog_event(message: str):
+    """Write timestamped entry to watchdog log."""
+    timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
+    entry = f"[{timestamp}] {message}"
+    for path in [WATCHDOG_LOG_FILE, LOCAL_WATCHDOG_LOG]:
+        try:
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(path, "a") as f:
+                f.write(entry + "\n")
+            break
+        except Exception:
+            continue
+    return entry
+
+def kick_session(s: Dict[str, Any], reason: str = ""):
+    """Disconnect a specific session and clean up its records."""
+    iface = s.get("interface", "")
+    pid = s.get("pid", "-")
+    container = s.get("container", "l2tp-server")
+    user = s.get("username", "")
+    ip = s.get("ip", "")
+    proto = s.get("protocol", "VPN")
+
+    # Send SIGTERM then SIGKILL to pppd
+    if pid != "-" and str(pid).isdigit():
+        run_docker_cmd(f"docker exec {container} kill -TERM {pid} 2>/dev/null")
+        run_cmd(f"kill -TERM {pid} 2>/dev/null || true")
+        time.sleep(0.3)
+        run_docker_cmd(f"docker exec {container} kill -KILL {pid} 2>/dev/null")
+        run_cmd(f"kill -KILL {pid} 2>/dev/null || true")
+
+    if iface:
+        run_docker_cmd(f"docker exec {container} pkill -f {iface} 2>/dev/null")
+        run_cmd(f"pkill -f {iface} 2>/dev/null || true")
+
+    # Clean active files
+    for p in [LOCAL_ACTIVE_FILE, "/var/run/active_ppp_users.txt"]:
+        if os.path.exists(p):
+            run_cmd(f"sed -i '/^{iface}|/d' {p} 2>/dev/null || true")
+
+    # Log kick event
+    msg = f"[KICK] User '{user}' on {iface} ({ip}, PID: {pid}, Proto: {proto})"
+    if reason:
+        msg += f" - Alasan: {reason}"
+    log_watchdog_event(msg)
+
 def kick_user(target: str):
-    """Disconnect a client by username or IP."""
+    """Disconnect a client by username, IP, or interface."""
     sessions = get_active_sessions()
-    targets = [s for s in sessions if s["username"].lower() == target.lower() or s["ip"] == target]
+    targets = [s for s in sessions if s["username"].lower() == target.lower() or s["ip"] == target or s["interface"].lower() == target.lower()]
 
     if not targets:
-        console.print(f"[bold red]❌ User atau IP '{target}' tidak ditemukan di sesi aktif![/bold red]")
+        console.print(f"[bold red]❌ User, IP, atau Interface '{target}' tidak ditemukan di sesi aktif![/bold red]")
         return
 
     for t in targets:
-        console.print(f"Disconnecting [bold cyan]{t['username']}[/bold cyan] ({t['protocol']} - {t['ip']}) on {t['container']}...")
-        if t["pid"] != "-":
-            run_docker_cmd(f"docker exec {t['container']} kill -TERM {t['pid']}")
-            console.print(f"[bold green]✔ Signal TERM dikirim ke PID {t['pid']}![/bold green]")
-        else:
-            # Fallback: kill pppd associated with interface
-            run_docker_cmd(f"docker exec {t['container']} pkill -f {t['interface']}")
-            console.print(f"[bold green]✔ pppd interface {t['interface']} di-pkill![/bold green]")
+        console.print(f"Disconnecting [bold cyan]{t['username']}[/bold cyan] ({t['protocol']} - {t['interface']} - {t['ip']})...")
+        kick_session(t, reason="Manual kick by admin")
+        console.print(f"[bold green]✔ Sesi {t['interface']} ({t['username']}) berhasil diputuskan![/bold green]")
+
+def get_interface_traffic(iface: str) -> Dict[str, Any]:
+    """Read interface rx/tx packets and bytes directly from /sys/class/net."""
+    stats = {"rx_packets": 0, "tx_packets": 0, "rx_bytes": 0, "tx_bytes": 0, "exists": False}
+    sys_path = f"/sys/class/net/{iface}/statistics"
+    if os.path.exists(sys_path):
+        stats["exists"] = True
+        for metric in ["rx_packets", "tx_packets", "rx_bytes", "tx_bytes"]:
+            try:
+                with open(os.path.join(sys_path, metric), "r") as f:
+                    stats[metric] = int(f.read().strip())
+            except Exception:
+                pass
+    return stats
+
+def check_and_kick_stuck_duplicates(prev_traffic: Dict[str, Dict[str, Any]]) -> Tuple[Dict[str, Dict[str, Any]], int]:
+    """Inspect active sessions. For duplicate usernames, kick the stuck or older session."""
+    # ponytail: Linear O(N) scan per interval. Sufficient for VPN servers up to thousands of concurrent users. Upgrade path: event-driven netlink/proc monitoring.
+    sessions = get_active_sessions()
+    current_traffic: Dict[str, Dict[str, Any]] = {}
+    kicked_count = 0
+
+    for s in sessions:
+        iface = s["interface"]
+        current_traffic[iface] = get_interface_traffic(iface)
+
+    user_sessions_map: Dict[str, List[Dict[str, Any]]] = {}
+    for s in sessions:
+        u = s["username"].lower()
+        if u and u != "unknown":
+            user_sessions_map.setdefault(u, []).append(s)
+
+    for username, s_list in user_sessions_map.items():
+        if len(s_list) <= 1:
+            # Single session: untouched
+            continue
+
+        # Duplicate detected!
+        scored_sessions = []
+        for s in s_list:
+            iface = s["interface"]
+            curr = current_traffic.get(iface, {})
+            prev = prev_traffic.get(iface)
+
+            if prev is not None and curr.get("exists", False):
+                delta_pkts = (curr.get("rx_packets", 0) - prev.get("rx_packets", 0)) + \
+                             (curr.get("tx_packets", 0) - prev.get("tx_packets", 0))
+            else:
+                delta_pkts = None
+
+            ts = s.get("timestamp", 0)
+            scored_sessions.append({
+                "session": s,
+                "delta_pkts": delta_pkts,
+                "timestamp": ts,
+                "exists": curr.get("exists", False)
+            })
+
+        # Sort: healthy/active session first
+        def sort_key(item):
+            exists_score = 1 if item["exists"] else 0
+            if item["delta_pkts"] is not None:
+                traffic_score = 1 if item["delta_pkts"] > 0 else 0
+            else:
+                traffic_score = 0.5
+            return (exists_score, traffic_score, item["timestamp"])
+
+        scored_sessions.sort(key=sort_key, reverse=True)
+
+        healthy = scored_sessions[0]
+        stuck_candidates = scored_sessions[1:]
+
+        for cand in stuck_candidates:
+            s_cand = cand["session"]
+            delta_str = f"{cand['delta_pkts']} pkts" if cand['delta_pkts'] is not None else "no baseline"
+            reason = f"Duplikat stuck (traffic delta: {delta_str}, connect time: {cand['timestamp']}, dipertahankan: {healthy['session']['interface']})"
+            kick_session(s_cand, reason=reason)
+            kicked_count += 1
+
+    return current_traffic, kicked_count
+
+def run_watchdog(interval: int = 10, once: bool = False):
+    """Run VPN watchdog daemon to monitor and auto-kick stuck duplicate sessions."""
+    console.print(Rule("[bold magenta]VPN Auto-Kick Watchdog Daemon[/bold magenta]"))
+    console.print(f"[*] Watchdog dimulai (Interval: [bold green]{interval} detik[/bold green], Mode: {'1x Check' if once else 'Continuous Daemon'})...")
+    console.print(f"[*] Log tersimpan di [cyan]{WATCHDOG_LOG_FILE}[/cyan]")
+    log_watchdog_event(f"[WATCHDOG-START] Watchdog daemon started (interval: {interval}s, once: {once})")
+
+    prev_traffic: Dict[str, Dict[str, Any]] = {}
+
+    if once:
+        sessions = get_active_sessions()
+        for s in sessions:
+            iface = s["interface"]
+            prev_traffic[iface] = get_interface_traffic(iface)
+
+        time.sleep(2)
+        _, kicked = check_and_kick_stuck_duplicates(prev_traffic)
+        console.print(f"[bold green]✔ Pemeriksaan selesai. Sesi stuck di-kick: {kicked}[/bold green]")
+        return
+
+    try:
+        while True:
+            prev_traffic, kicked = check_and_kick_stuck_duplicates(prev_traffic)
+            if kicked > 0:
+                console.print(f"[{time.strftime('%H:%M:%S')}] [bold red]Auto-kicked {kicked} stuck duplicate session(s)[/bold red]")
+            time.sleep(interval)
+    except KeyboardInterrupt:
+        console.print("\n[yellow]Watchdog dihentikan oleh pengguna.[/yellow]")
+        log_watchdog_event("[WATCHDOG-STOP] Watchdog stopped by user")
+    except Exception as e:
+        console.print(f"\n[bold red]Error pada watchdog: {e}[/bold red]")
+        log_watchdog_event(f"[WATCHDOG-ERROR] Exception: {e}")
 
 def manage_containers(action: str, service: str = "all"):
     """Handle docker compose start, stop, restart, rebuild."""
@@ -549,7 +738,27 @@ def manage_containers(action: str, service: str = "all"):
     console.print("[bold green]✔ Selesai![/bold green]")
 
 def view_logs(service: str = "l2tp", follow: bool = True, lines: int = 40):
-    """View or tail container logs."""
+    """View or tail container or watchdog logs."""
+    if service == "watchdog":
+        log_path = WATCHDOG_LOG_FILE if os.path.exists(WATCHDOG_LOG_FILE) else LOCAL_WATCHDOG_LOG
+        if not os.path.exists(log_path):
+            console.print(f"[yellow]File log watchdog belum ditemukan di {log_path}. Membuat file log baru...[/yellow]")
+            os.makedirs(os.path.dirname(log_path), exist_ok=True)
+            with open(log_path, "w") as f:
+                f.write(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] Watchdog log initialized.\n")
+
+        console.print(f"[bold cyan]Menampilkan log Watchdog ({log_path}, {lines} baris terakhir)...[/bold cyan]")
+        if follow:
+            console.print("[dim]Tekan Ctrl+C untuk keluar dari log tailing.[/dim]\n")
+            try:
+                os.system(f"tail -f -n {lines} {log_path}")
+            except KeyboardInterrupt:
+                console.print("\n[yellow]Log tailing dihentikan.[/yellow]")
+        else:
+            out = run_cmd(f"tail -n {lines} {log_path}")
+            console.print(out)
+        return
+
     container = "l2tp-server" if service == "l2tp" else "pptp-server"
     follow_flag = "-f" if follow else ""
     
@@ -563,6 +772,7 @@ def view_logs(service: str = "l2tp", follow: bool = True, lines: int = 40):
     else:
         out = run_docker_cmd(f"docker exec {container} tail -n {lines} /var/log/ppp.log")
         console.print(out)
+
 
 def run_diagnostics():
     """Run diagnostic checks on RADIUS, containers, UFW firewall, and PPP devices."""
@@ -670,12 +880,13 @@ def interactive_menu():
         console.print("[4] ❌ Disconnect / Kick User Active")
         console.print("[5] ⚡ Kelola Limit Bandwidth (Rate Limiting)")
         console.print("[6] 🔄 Restart Service VPN (L2TP / PPTP / All)")
-        console.print("[7] 📜 View & Tail Log PPP (`ppp.log`)")
+        console.print("[7] 📜 View & Tail Log PPP / Watchdog")
         console.print("[8] 🩺 Jalankan System & RADIUS Diagnostics")
+        console.print("[9] 🛡️ Auto-Kick Watchdog (Cek Stuck / Log / Service)")
         console.print("[0] 🚪 Keluar")
         console.print()
 
-        choice = Prompt.ask("Pilih menu", choices=["1", "2", "3", "4", "5", "6", "7", "8", "0"], default="1")
+        choice = Prompt.ask("Pilih menu", choices=["1", "2", "3", "4", "5", "6", "7", "8", "9", "0"], default="1")
 
         if choice == "1":
             console.clear()
@@ -696,7 +907,7 @@ def interactive_menu():
         elif choice == "4":
             console.clear()
             print_active_users_table(live_mode=False)
-            target = Prompt.ask("Masukkan Username atau IP User yang ingin di-disconnect")
+            target = Prompt.ask("Masukkan Username, IP, atau Interface yang ingin di-disconnect")
             if target:
                 if Confirm.ask(f"Yakin ingin memutuskan koneksi '{target}'?"):
                     kick_user(target)
@@ -715,7 +926,7 @@ def interactive_menu():
             Prompt.ask("\nTekan Enter untuk kembali ke menu utama")
 
         elif choice == "7":
-            svc = Prompt.ask("Pilih log service", choices=["l2tp", "pptp"], default="l2tp")
+            svc = Prompt.ask("Pilih log service", choices=["l2tp", "pptp", "watchdog"], default="l2tp")
             lines = Prompt.ask("Jumlah baris log", default="40")
             view_logs(service=svc, follow=True, lines=int(lines))
             Prompt.ask("\nTekan Enter untuk kembali ke menu utama")
@@ -723,6 +934,28 @@ def interactive_menu():
         elif choice == "8":
             console.clear()
             run_diagnostics()
+            Prompt.ask("\nTekan Enter untuk kembali ke menu utama")
+
+        elif choice == "9":
+            console.clear()
+            console.print(Rule("[bold magenta]VPN Auto-Kick Watchdog Menu[/bold magenta]"))
+            console.print("[1] 🔍 Jalankan Pemeriksaan Stuck Duplikat Sekarang (1x Check)")
+            console.print("[2] 📜 Tail Log Watchdog (/var/log/vpn-watchdog.log)")
+            console.print("[3] ⚙️ Cek Status Service Systemd (vpn-watchdog.service)")
+            console.print("[4] 🔄 Restart Service Systemd Watchdog")
+            console.print("[5] 🚀 Jalankan Daemon di Terminal (Foreground)")
+            console.print("[0] Kembali ke Menu Utama")
+            sub_c = Prompt.ask("Pilih opsi", choices=["1", "2", "3", "4", "5", "0"], default="1")
+            if sub_c == "1":
+                run_watchdog(once=True)
+            elif sub_c == "2":
+                view_logs(service="watchdog", follow=True, lines=30)
+            elif sub_c == "3":
+                console.print(run_cmd("systemctl status vpn-watchdog.service 2>/dev/null || true"))
+            elif sub_c == "4":
+                console.print(run_cmd("sudo systemctl restart vpn-watchdog.service && systemctl status vpn-watchdog.service --no-pager 2>/dev/null || true"))
+            elif sub_c == "5":
+                run_watchdog(interval=10, once=False)
             Prompt.ask("\nTekan Enter untuk kembali ke menu utama")
 
         elif choice == "0":
@@ -743,8 +976,13 @@ def main():
     users_p.add_argument("-s", "--static", action="store_true", help="Cetak tabel statis 1x (non-realtime, bisa di-scroll dengan scrollbar terminal biasa)")
 
     # Subcommand: kick
-    kick_p = subparsers.add_parser("kick", help="Putuskan koneksi user aktif berdasarkan Username atau IP")
-    kick_p.add_argument("target", help="Username atau IP target")
+    kick_p = subparsers.add_parser("kick", help="Putuskan koneksi user aktif berdasarkan Username, IP, atau Interface")
+    kick_p.add_argument("target", help="Username, IP, atau Interface target")
+
+    # Subcommand: watchdog
+    watchdog_p = subparsers.add_parser("watchdog", help="Jalankan daemon / check auto-kick user duplikat stuck")
+    watchdog_p.add_argument("-i", "--interval", type=int, default=10, help="Interval loop watchdog dalam detik (default: 10)")
+    watchdog_p.add_argument("--once", action="store_true", help="Jalankan pemeriksaan 1x lalu keluar")
 
     # Subcommand: rate
     rate_p = subparsers.add_parser("rate", help="Kelola limitasi bandwidth (rate limits)")
@@ -765,8 +1003,8 @@ def main():
     manage_p.add_argument("-s", "--service", choices=["all", "l2tp", "pptp"], default="all", help="Service target")
 
     # Subcommand: logs
-    logs_p = subparsers.add_parser("logs", help="Tampilkan / tail log PPP kontainer")
-    logs_p.add_argument("-s", "--service", choices=["l2tp", "pptp"], default="l2tp", help="Service log target")
+    logs_p = subparsers.add_parser("logs", help="Tampilkan / tail log PPP kontainer atau Watchdog")
+    logs_p.add_argument("-s", "--service", choices=["l2tp", "pptp", "watchdog"], default="l2tp", help="Service log target")
     logs_p.add_argument("-n", "--lines", type=int, default=40, help="Jumlah baris log")
     logs_p.add_argument("--no-follow", action="store_true", help="Jangan tail (-f) log")
 
@@ -783,6 +1021,8 @@ def main():
         print_active_users_table(filter_keyword=args.filter, interval=args.interval, live_mode=not args.static)
     elif args.command == "kick":
         kick_user(args.target)
+    elif args.command == "watchdog":
+        run_watchdog(interval=args.interval, once=args.once)
     elif args.command == "rate":
         limits = get_bandwidth_limits()
         if not args.rate_action or args.rate_action == "list":
@@ -800,12 +1040,19 @@ def main():
             save_bandwidth_limits(limits)
             console.print("[bold green]✔ Default limit global diubah ke '%s'![/bold green]" % args.rate)
             apply_all_rate_limits_live()
+        elif args.command == "manage":
+            manage_containers(args.action, args.service)
+        elif args.command == "logs":
+            view_logs(service=args.service, follow=not args.no_follow, lines=args.lines)
+        elif args.command == "diag":
+            run_diagnostics()
     elif args.command == "manage":
         manage_containers(args.action, args.service)
     elif args.command == "logs":
         view_logs(service=args.service, follow=not args.no_follow, lines=args.lines)
     elif args.command == "diag":
         run_diagnostics()
+
 
 if __name__ == "__main__":
     main()

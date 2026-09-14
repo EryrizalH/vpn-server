@@ -1,3 +1,5 @@
 #!/bin/bash
 INTERFACE="$1"
+RUN_DIR="/var/run/vpn"
+sed -i "/^${INTERFACE}|/d" "$RUN_DIR/active_ppp_users.txt" 2>/dev/null || true
 sed -i "/^${INTERFACE}|/d" /var/run/active_ppp_users.txt 2>/dev/null || true

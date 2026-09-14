@@ -11,6 +11,8 @@ Sangat cocok digunakan untuk koneksi VPN MikroTik & Windows Client dengan dukung
 - **All-in-One Installer (`install.sh`)**: Skrip instalasi interaktif wizard otomatis (install Docker, sysctl, kernel module, UFW rules, & CLI).
 - **FreeRADIUS Integration**: Menggunakan `radiusclient` untuk autentikasi user PPTP dan L2TP ke server FreeRADIUS terpusat.
 - **Python TUI CLI (`vpn-cli`)**: Tampilan antarmuka terminal interaktif berbasis `python3-rich` untuk monitoring status real-time, statistik koneksi user, filter user, kick/disconnect user, dan log tailing.
+- **Auto-Kick User Duplikat & Stuck**: Mekanisme dual-tier (kick-on-connect instan via `ip-up` + background systemd watchdog tiap 10 detik) untuk memutus sesi stuck dan membersihkan user dobel lintas protokol (L2TP/PPTP).
+- **Tuned LCP Echo Keepalive**: Interval LCP echo dioptimalkan ke 10s / 3 failure (30 detik) untuk mendeteksi koneksi terputus dengan cepat.
 - **Auto Environment Configuration**: Menjaga kerahasiaan kredensial RADIUS menggunakan file `.env` lokal tanpa pembocoran rahasia di repositori.
 
 ---
@@ -68,6 +70,15 @@ vpn-cli diag
 
 # Tail Log PPP Real-Time
 vpn-cli logs -s l2tp
+
+# Jalankan 1x Pemeriksaan User Duplikat Stuck
+vpn-cli watchdog --once
+
+# Jalankan Watchdog Daemon (Foreground)
+vpn-cli watchdog --interval 10
+
+# Tail Log Auto-Kick Watchdog
+vpn-cli logs -s watchdog
 ```
 
 ---
