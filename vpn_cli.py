@@ -808,6 +808,24 @@ def run_diagnostics():
     is_pptp_port = "1723/tcp" in ufw_out or "ALLOW" in ufw_out
     table.add_row("UFW Firewall Ports", "1701/udp (L2TP) & 1723/tcp (PPTP)", "🟢 OK" if (is_l2tp_port and is_pptp_port) else "⚠️ CHECK")
 
+    # ponytail: Check kernel routing & NAT for client internet breakout (Full Tunnel)
+    # 6. Check IPv4 Forwarding
+    ip_fwd = run_cmd("cat /proc/sys/net/ipv4/ip_forward 2>/dev/null || sysctl -n net.ipv4.ip_forward 2>/dev/null")
+    table.add_row("IPv4 Forwarding", "net.ipv4.ip_forward = 1" if ip_fwd == "1" else f"net.ipv4.ip_forward = {ip_fwd}", "🟢 OK" if ip_fwd == "1" else "🔴 DISABLED")
+
+    # 7. Check IPTables NAT MASQUERADE
+    nat_out = run_cmd("sudo iptables -t nat -S POSTROUTING 2>/dev/null || iptables -t nat -S POSTROUTING 2>/dev/null")
+    if not nat_out or "Permission denied" in nat_out:
+        nat_out = run_docker_cmd("docker exec pptp-server iptables -t nat -S POSTROUTING 2>/dev/null") or ""
+    has_masq = "MASQUERADE" in nat_out
+    table.add_row("IPTables NAT Masquerade", "Rule MASQUERADE active" if has_masq else "Rule MASQUERADE missing", "🟢 OK" if has_masq else "⚠️ MISSING")
+
+    # 8. Check UFW Forward Policy
+    ufw_policy = run_cmd("grep -E '^DEFAULT_FORWARD_POLICY=' /etc/default/ufw 2>/dev/null | cut -d'=' -f2 | tr -d '\"' || true")
+    if ufw_policy:
+        is_accept = ufw_policy.strip().upper() == "ACCEPT"
+        table.add_row("UFW Forward Policy", f"DEFAULT_FORWARD_POLICY={ufw_policy}", "🟢 ACCEPT" if is_accept else f"⚠️ {ufw_policy}")
+
     console.print(table)
 
 def print_rate_limits_table():

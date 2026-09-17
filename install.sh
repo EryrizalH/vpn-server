@@ -110,11 +110,19 @@ EOF
 
     # Configure UFW if enabled
     if command -v ufw &>/dev/null && ufw status | grep -q "active"; then
-        echo -e "${YELLOW}[*] UFW aktif. Membuka port VPN (1723/tcp, 1701/udp, 500/udp, 4500/udp)...${NC}"
+        echo -e "${YELLOW}[*] UFW aktif. Membuka port VPN & mengonfigurasi forward routing...${NC}"
         ufw allow 1723/tcp comment "VPN PPTP" >/dev/null 2>&1 || true
         ufw allow 1701/udp comment "VPN L2TP" >/dev/null 2>&1 || true
         ufw allow 500/udp comment "VPN IPsec ISAKMP" >/dev/null 2>&1 || true
         ufw allow 4500/udp comment "VPN IPsec NAT-T" >/dev/null 2>&1 || true
+
+        # ponytail: Allow forwarding in UFW so VPN clients have internet access (Full Tunnel)
+        if [ -f /etc/default/ufw ]; then
+            sed -i 's/^DEFAULT_FORWARD_POLICY=.*/DEFAULT_FORWARD_POLICY="ACCEPT"/' /etc/default/ufw
+        fi
+        ufw route allow in on ppp+ 2>/dev/null || true
+        ufw route allow out on ppp+ 2>/dev/null || true
+        ufw reload >/dev/null 2>&1 || true
     fi
 
     echo -e "${GREEN}[✔] Konfigurasi Host & Kernel selesai.${NC}"
