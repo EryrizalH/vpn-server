@@ -115,6 +115,7 @@ EOF
         ufw allow 1701/udp comment "VPN L2TP" >/dev/null 2>&1 || true
         ufw allow 500/udp comment "VPN IPsec ISAKMP" >/dev/null 2>&1 || true
         ufw allow 4500/udp comment "VPN IPsec NAT-T" >/dev/null 2>&1 || true
+        ufw allow 6155/tcp comment "VPN REST API" >/dev/null 2>&1 || true
 
         # ponytail: Allow forwarding in UFW so VPN clients have internet access (Full Tunnel)
         if [ -f /etc/default/ufw ]; then
@@ -133,6 +134,17 @@ deploy_files() {
     local target_dir="$1"
     local radius_ip="$2"
     local radius_secret="$3"
+    local api_key="${4:-}"
+    local api_port="${5:-6155}"
+
+    # If api_key not provided, preserve existing from .env or generate one
+    if [ -z "$api_key" ]; then
+        if [ -f "$target_dir/.env" ] && grep -q "^API_KEY=" "$target_dir/.env"; then
+            api_key=$(grep "^API_KEY=" "$target_dir/.env" | cut -d'=' -f2- | tr -d '"' | tr -d "'")
+        else
+            api_key=$(head /dev/urandom | tr -dc A-Za-z0-9 2>/dev/null | head -c 24 || openssl rand -hex 12 2>/dev/null || echo "vpn_api_key_$(date +%s)")
+        fi
+    fi
 
     echo -e "\n${YELLOW}[3/6] Menyalin file proyek ke $target_dir...${NC}"
     mkdir -p "$target_dir"
@@ -150,6 +162,8 @@ deploy_files() {
 RADIUS_SERVER=$radius_ip
 RADIUS_SECRET=$radius_secret
 VPN_DIR=$target_dir
+API_PORT=$api_port
+API_KEY=$api_key
 EOF
 
     # Configure radiusclient.conf in L2TP & PPTP
@@ -249,6 +263,35 @@ EOF
     echo -e "${GREEN}[✔] Service 'vpn-watchdog.service' berhasil diaktifkan & berjalan otomatis di background.${NC}"
 }
 
+# Function: Setup REST API CRM Systemd Service
+setup_api_service() {
+    local target_dir="$1"
+    echo -e "\n${YELLOW}[*] Menyiapkan Systemd Service REST API Gateway (vpn-api.service)...${NC}"
+
+    cat <<EOF > /etc/systemd/system/vpn-api.service
+[Unit]
+Description=VPN REST API Server for CRM Integration
+After=network.target docker.service
+Requires=docker.service
+
+[Service]
+Type=simple
+WorkingDirectory=$target_dir
+ExecStart=/usr/local/bin/vpn-cli api
+Restart=always
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+    systemctl daemon-reload
+    systemctl enable --now vpn-api.service 2>/dev/null || true
+    echo -e "${GREEN}[✔] Service 'vpn-api.service' (Port 6155) berhasil diaktifkan & berjalan otomatis di background.${NC}"
+}
+
 # Function: Interactive Installation Wizard
 run_installation() {
     show_banner
@@ -269,12 +312,23 @@ run_installation() {
         exit 1
     fi
 
+    # Generate secure random API key as recommendation
+    RANDOM_API_KEY=$(head /dev/urandom | tr -dc A-Za-z0-9 2>/dev/null | head -c 24 || openssl rand -hex 12 2>/dev/null || echo "vpn_api_key_$(date +%s)")
+
+    read -p "Masukkan API Key REST API untuk CRM [Default: $RANDOM_API_KEY]: " INPUT_API_KEY
+    API_KEY=${INPUT_API_KEY:-"$RANDOM_API_KEY"}
+
+    read -p "Masukkan Port REST API Gateway [Default: 6155]: " INPUT_API_PORT
+    API_PORT=${INPUT_API_PORT:-"6155"}
+
     read -p "Masukkan Direktori Instalasi [Default: $DEFAULT_INSTALL_DIR]: " INSTALL_DIR
     INSTALL_DIR=${INSTALL_DIR:-"$DEFAULT_INSTALL_DIR"}
 
     echo -e "\n${CYAN}${BOLD}Ringkasan Konfigurasi:${NC}"
     echo -e "  - FreeRADIUS Server IP : ${GREEN}$RADIUS_IP${NC}"
     echo -e "  - FreeRADIUS Secret    : ${GREEN}$RADIUS_SECRET${NC}"
+    echo -e "  - REST API CRM Port    : ${GREEN}$API_PORT${NC}"
+    echo -e "  - REST API Key (CRM)   : ${GREEN}$API_KEY${NC}"
     echo -e "  - Lokasi Instalasi     : ${GREEN}$INSTALL_DIR${NC}"
     echo ""
 
@@ -288,10 +342,11 @@ run_installation() {
 
     install_dependencies
     configure_host
-    deploy_files "$INSTALL_DIR" "$RADIUS_IP" "$RADIUS_SECRET"
+    deploy_files "$INSTALL_DIR" "$RADIUS_IP" "$RADIUS_SECRET" "$API_KEY" "$API_PORT"
     start_containers "$INSTALL_DIR"
     setup_cli "$INSTALL_DIR"
     setup_watchdog_service "$INSTALL_DIR"
+    setup_api_service "$INSTALL_DIR"
 
     echo -e "\n${GREEN}${BOLD}=================================================================${NC}"
     echo -e "${GREEN}${BOLD}   🎉 INSTALASI VPN SERVER BERHASIL DISELESAIKAN!               ${NC}"
@@ -300,8 +355,14 @@ run_installation() {
     echo -e "   ${CYAN}vpn-cli${NC}                  (Menu Interaktif TUI)"
     echo -e "   ${CYAN}vpn-cli status${NC}           (Melihat Dashboard Connection & Watchdog Status)"
     echo -e "   ${CYAN}vpn-cli users${NC}            (Melihat User VPN Aktif)"
+    echo -e "   ${CYAN}vpn-cli api${NC}              (REST API Gateway CRM di Port $API_PORT)"
     echo -e "   ${CYAN}vpn-cli logs -s watchdog${NC} (Melihat Log Auto-Kick Watchdog)"
     echo -e "   ${CYAN}vpn-cli diag${NC}             (Menjalankan Pengujian Diagnostik RADIUS)"
+    echo ""
+    echo -e "${CYAN}${BOLD}🔑 Kredensial Integrasi CRM REST API:${NC}"
+    echo -e "   - Endpoint URL : ${GREEN}http://<IP_SERVER>:${API_PORT}/api/users${NC}"
+    echo -e "   - API Key      : ${YELLOW}${API_KEY}${NC}"
+    echo -e "   - Header Auth  : ${CYAN}Authorization: Bearer ${API_KEY}${NC}"
     echo ""
 }
 
@@ -317,7 +378,8 @@ rebuild_containers() {
     cd "$target_dir"
     docker compose up -d --build
     setup_watchdog_service "$target_dir"
-    echo -e "${GREEN}[✔] Rebuild selesai! Container & Watchdog telah diperbarui dan berjalan otomatis di background.${NC}"
+    setup_api_service "$target_dir"
+    echo -e "${GREEN}[✔] Rebuild selesai! Container, Watchdog & API telah diperbarui dan berjalan otomatis di background.${NC}"
 }
 
 # Function: Uninstall VPN Server
@@ -331,7 +393,10 @@ uninstall_vpn() {
             cd "$target_dir" && docker compose down -v --rmi all 2>/dev/null || true
         fi
         
-        echo -e "${YELLOW}[*] Menghentikan dan menghapus watchdog service...${NC}"
+        echo -e "${YELLOW}[*] Menghentikan dan menghapus API & watchdog service...${NC}"
+        systemctl stop vpn-api.service 2>/dev/null || true
+        systemctl disable vpn-api.service 2>/dev/null || true
+        rm -f /etc/systemd/system/vpn-api.service
         systemctl stop vpn-watchdog.service 2>/dev/null || true
         systemctl disable vpn-watchdog.service 2>/dev/null || true
         rm -f /etc/systemd/system/vpn-watchdog.service

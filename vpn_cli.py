@@ -15,6 +15,11 @@ import argparse
 import select
 import tty
 import termios
+import json
+import urllib.parse
+from datetime import datetime, timezone
+from http.server import HTTPServer, BaseHTTPRequestHandler
+from socketserver import ThreadingMixIn
 from typing import List, Dict, Any, Optional, Tuple
 
 import ipaddress
@@ -61,8 +66,13 @@ def load_env_file(filepath: str):
 load_env_file(os.path.join(SCRIPT_DIR, ".env"))
 
 VPN_DIR = os.environ.get("VPN_DIR", SCRIPT_DIR)
+if VPN_DIR != SCRIPT_DIR:
+    load_env_file(os.path.join(VPN_DIR, ".env"))
+
 RADIUS_SERVER = os.environ.get("RADIUS_SERVER", "127.0.0.1")
 RADIUS_SECRET = os.environ.get("RADIUS_SECRET", "testing123")
+API_PORT = int(os.environ.get("API_PORT", 6155))
+API_KEY = os.environ.get("API_KEY", "")
 
 WATCHDOG_LOG_FILE = "/var/log/vpn-watchdog.log"
 LOCAL_RUN_DIR = os.path.join(VPN_DIR, "run")
@@ -589,19 +599,21 @@ def kick_session(s: Dict[str, Any], reason: str = ""):
         msg += f" - Alasan: {reason}"
     log_watchdog_event(msg)
 
-def kick_user(target: str):
-    """Disconnect a client by username, IP, or interface."""
+def kick_user(target: str) -> List[Dict[str, Any]]:
+    """Disconnect a client by username, IP, or interface. Returns list of kicked sessions."""
     sessions = get_active_sessions()
     targets = [s for s in sessions if s["username"].lower() == target.lower() or s["ip"] == target or s["interface"].lower() == target.lower()]
 
     if not targets:
         console.print(f"[bold red]❌ User, IP, atau Interface '{target}' tidak ditemukan di sesi aktif![/bold red]")
-        return
+        return []
 
     for t in targets:
         console.print(f"Disconnecting [bold cyan]{t['username']}[/bold cyan] ({t['protocol']} - {t['interface']} - {t['ip']})...")
         kick_session(t, reason="Manual kick by admin")
         console.print(f"[bold green]✔ Sesi {t['interface']} ({t['username']}) berhasil diputuskan![/bold green]")
+
+    return targets
 
 def get_interface_traffic(iface: str) -> Dict[str, Any]:
     """Read interface rx/tx packets and bytes directly from /sys/class/net."""
@@ -716,6 +728,267 @@ def run_watchdog(interval: int = 10, once: bool = False):
         console.print(f"\n[bold red]Error pada watchdog: {e}[/bold red]")
         log_watchdog_event(f"[WATCHDOG-ERROR] Exception: {e}")
 
+# ==============================================================================
+# REST API Server for CRM Integration
+# ==============================================================================
+
+class ThreadedHTTPServer(ThreadingMixIn, HTTPServer):
+    """Multi-threaded HTTP Server so concurrent CRM requests don't block."""
+    daemon_threads = True
+    allow_reuse_address = True
+
+
+class VPNAPIHandler(BaseHTTPRequestHandler):
+    """HTTP Request Handler providing REST API endpoints for CRM."""
+    server_api_key: str = ""
+
+    def send_json(self, status_code: int, data: Any):
+        """Send JSON response with proper headers and CORS support."""
+        try:
+            payload = json.dumps(data, indent=2).encode("utf-8")
+            self.send_response(status_code)
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header("Content-Length", str(len(payload)))
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+            self.send_header("Access-Control-Allow-Headers", "Authorization, Content-Type, X-API-Key")
+            self.end_headers()
+            self.wfile.write(payload)
+        except (BrokenPipeError, ConnectionResetError):
+            pass
+
+    def do_OPTIONS(self):
+        """Handle CORS preflight requests."""
+        self.send_response(204)
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+        self.send_header("Access-Control-Allow-Headers", "Authorization, Content-Type, X-API-Key")
+        self.end_headers()
+
+    def check_auth(self, query: Dict[str, List[str]]) -> bool:
+        """Verify Bearer token, X-API-Key header, or token query param."""
+        if not self.server_api_key or not self.server_api_key.strip():
+            return False
+
+        # 1. Check Authorization: Bearer <TOKEN>
+        auth = self.headers.get("Authorization", "")
+        if auth.lower().startswith("bearer ") and auth[7:].strip() == self.server_api_key:
+            return True
+
+        # 2. Check X-API-Key: <TOKEN>
+        x_key = self.headers.get("X-API-Key", "")
+        if x_key and x_key.strip() == self.server_api_key:
+            return True
+
+        # 3. Check query param ?token=... or ?api_key=...
+        token_q = query.get("token", [None])[0] or query.get("api_key", [None])[0]
+        if token_q and token_q.strip() == self.server_api_key:
+            return True
+
+        return False
+
+    def do_GET(self):
+        """Handle GET requests for health and active users."""
+        parsed = urllib.parse.urlparse(self.path)
+        path = parsed.path.rstrip("/")
+        query = urllib.parse.parse_qs(parsed.query)
+
+        # Healthcheck endpoint (no auth required)
+        if path in ("/api/health", "/api/status", "/health"):
+            sessions = get_active_sessions()
+            self.send_json(200, {
+                "status": "ok",
+                "service": "vpn-rest-api",
+                "timestamp": int(time.time()),
+                "active_users_count": len(sessions)
+            })
+            return
+
+        # Security check: Bearer Token / API Key
+        if not self.check_auth(query):
+            self.send_json(401, {
+                "status": "error",
+                "message": "Unauthorized: Missing or invalid API Key. Include 'Authorization: Bearer <TOKEN>' or 'X-API-Key'."
+            })
+            return
+
+        # Endpoint: GET /api/users
+        if path == "/api/users":
+            sessions = get_active_sessions()
+            now_ts = int(time.time())
+            username_q = query.get("username", [None])[0]
+            ip_q = query.get("ip", [None])[0]
+            filter_q = query.get("filter", [None])[0]
+
+            user_list = []
+            for s in sessions:
+                ts = s.get("timestamp", 0)
+                uptime = max(0, now_ts - ts) if ts > 0 else 0
+                conn_iso = datetime.fromtimestamp(ts, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ") if ts > 0 else None
+
+                user_entry = {
+                    "username": s.get("username"),
+                    "ip": s.get("ip"),
+                    "protocol": s.get("protocol"),
+                    "interface": s.get("interface"),
+                    "connected_at": conn_iso,
+                    "timestamp": ts,
+                    "uptime_seconds": uptime
+                }
+
+                if username_q and s.get("username", "").lower() != username_q.lower():
+                    continue
+                if ip_q and s.get("ip", "") != ip_q:
+                    continue
+                if filter_q:
+                    fq = filter_q.lower()
+                    if fq not in s.get("username", "").lower() and fq not in s.get("ip", "") and fq not in s.get("interface", "").lower():
+                        continue
+
+                user_list.append(user_entry)
+
+            self.send_json(200, {
+                "status": "success",
+                "total": len(user_list),
+                "data": user_list
+            })
+            return
+
+        # Endpoint: GET /api/users/<username>
+        if path.startswith("/api/users/"):
+            parts = path.split("/")
+            if len(parts) == 4:
+                target_user = parts[3].strip()
+                sessions = get_active_sessions()
+                matched = [s for s in sessions if s.get("username", "").lower() == target_user.lower()]
+                if matched:
+                    s = matched[0]
+                    ts = s.get("timestamp", 0)
+                    now_ts = int(time.time())
+                    uptime = max(0, now_ts - ts) if ts > 0 else 0
+                    conn_iso = datetime.fromtimestamp(ts, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ") if ts > 0 else None
+                    self.send_json(200, {
+                        "status": "success",
+                        "data": {
+                            "username": s.get("username"),
+                            "ip": s.get("ip"),
+                            "protocol": s.get("protocol"),
+                            "interface": s.get("interface"),
+                            "connected_at": conn_iso,
+                            "timestamp": ts,
+                            "uptime_seconds": uptime
+                        }
+                    })
+                    return
+                else:
+                    self.send_json(404, {
+                        "status": "error",
+                        "message": f"User '{target_user}' is not currently active"
+                    })
+                    return
+
+        self.send_json(404, {"status": "error", "message": f"Endpoint '{path}' not found"})
+
+    def do_POST(self):
+        """Handle POST requests for action execution (e.g. kick user)."""
+        parsed = urllib.parse.urlparse(self.path)
+        path = parsed.path.rstrip("/")
+        query = urllib.parse.parse_qs(parsed.query)
+
+        if not self.check_auth(query):
+            self.send_json(401, {
+                "status": "error",
+                "message": "Unauthorized: Missing or invalid API Key."
+            })
+            return
+
+        target = None
+
+        # Route 1: POST /api/users/<username>/kick
+        parts = path.split("/")
+        if len(parts) == 5 and parts[1] == "api" and parts[2] == "users" and parts[4] == "kick":
+            target = parts[3]
+
+        # Route 2: POST /api/kick (target via query or JSON body)
+        if path == "/api/kick":
+            target = query.get("target", [None])[0] or query.get("username", [None])[0]
+            if not target:
+                try:
+                    content_length = int(self.headers.get("Content-Length", 0))
+                    if content_length > 0:
+                        body_bytes = self.rfile.read(content_length)
+                        body = json.loads(body_bytes.decode("utf-8"))
+                        target = body.get("target") or body.get("username")
+                except Exception:
+                    pass
+
+        if target:
+            kicked = kick_user(target)
+            if kicked:
+                self.send_json(200, {
+                    "status": "success",
+                    "message": f"User '{target}' successfully disconnected",
+                    "kicked": True,
+                    "total_kicked": len(kicked)
+                })
+            else:
+                self.send_json(404, {
+                    "status": "error",
+                    "message": f"User or target '{target}' not found in active sessions",
+                    "kicked": False
+                })
+            return
+
+        self.send_json(404, {"status": "error", "message": f"Endpoint '{path}' not found"})
+
+    def log_message(self, format, *args):
+        """Format clean access logs to stdout."""
+        sys.stdout.write(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] [REST-API] {self.address_string()} - {format % args}\n")
+        sys.stdout.flush()
+
+
+def run_api_server(host: str = "0.0.0.0", port: Optional[int] = None, api_key: Optional[str] = None):
+    """Run lightweight HTTP REST API server for CRM integration."""
+    final_port = port if port is not None else API_PORT
+    final_key = api_key if api_key is not None else API_KEY
+
+    if not final_key or not str(final_key).strip():
+        console.print("[bold red]❌ Error: API_KEY belum diset di file .env atau parameter --key.[/bold red]")
+        console.print("[yellow]Silakan tambahkan 'API_KEY=<token_rahasia>' pada file .env atau jalankan dengan opsi: vpn-cli api --key <token>[/yellow]")
+        sys.exit(1)
+
+    VPNAPIHandler.server_api_key = str(final_key).strip()
+
+    server_address = (host, final_port)
+    try:
+        httpd = ThreadedHTTPServer(server_address, VPNAPIHandler)
+    except Exception as e:
+        console.print(f"[bold red]❌ Gagal memulai REST API Server di {host}:{final_port}: {e}[/bold red]")
+        sys.exit(1)
+
+    console.print(Panel.fit(
+        f"[bold green]🚀 VPN REST API Server Berjalan[/bold green]\n\n"
+        f"• Host/Port : [bold cyan]http://{host}:{final_port}[/bold cyan]\n"
+        f"• API Key   : [bold yellow]{final_key}[/bold yellow]\n"
+        f"• Endpoints :\n"
+        f"    - GET  [cyan]/api/health[/cyan] (Healthcheck)\n"
+        f"    - GET  [cyan]/api/users[/cyan] (List user & IP aktif; filter: ?username=... | ?ip=...)\n"
+        f"    - GET  [cyan]/api/users/<username>[/cyan] (Detail user aktif)\n"
+        f"    - POST [cyan]/api/users/<username>/kick[/cyan] (Kick/disconnect user)\n\n"
+        f"[dim]Tekan Ctrl+C untuk menghentikan server.[/dim]",
+        title="[bold blue]VPN CRM REST API Gateway[/bold blue]",
+        border_style="blue"
+    ))
+
+    try:
+        httpd.serve_forever()
+    except KeyboardInterrupt:
+        console.print("\n[yellow][*] Menghentikan REST API server...[/yellow]")
+    finally:
+        httpd.server_close()
+        console.print("[green][✔] REST API server berhasil dihentikan.[/green]")
+
+
 def manage_containers(action: str, service: str = "all"):
     """Handle docker compose start, stop, restart, rebuild."""
     svc_arg = "" if service == "all" else ("l2tp-vpn" if service == "l2tp" else "pptp-vpn")
@@ -826,6 +1099,10 @@ def run_diagnostics():
         is_accept = ufw_policy.strip().upper() == "ACCEPT"
         table.add_row("UFW Forward Policy", f"DEFAULT_FORWARD_POLICY={ufw_policy}", "🟢 ACCEPT" if is_accept else f"⚠️ {ufw_policy}")
 
+    # 9. Check REST API Service (CRM)
+    api_status = run_cmd("systemctl is-active vpn-api.service 2>/dev/null").strip()
+    table.add_row("REST API Service (CRM)", f"vpn-api.service (Port {API_PORT})", "🟢 ACTIVE" if api_status == "active" else f"⚪ {api_status.upper() or 'INACTIVE'}")
+
     console.print(table)
 
 def print_rate_limits_table():
@@ -901,10 +1178,11 @@ def interactive_menu():
         console.print("[7] 📜 View & Tail Log PPP / Watchdog")
         console.print("[8] 🩺 Jalankan System & RADIUS Diagnostics")
         console.print("[9] 🛡️ Auto-Kick Watchdog (Cek Stuck / Log / Service)")
+        console.print("[10] 🌐 REST API Gateway CRM (Status / Restart / Foreground)")
         console.print("[0] 🚪 Keluar")
         console.print()
 
-        choice = Prompt.ask("Pilih menu", choices=["1", "2", "3", "4", "5", "6", "7", "8", "9", "0"], default="1")
+        choice = Prompt.ask("Pilih menu", choices=["1", "2", "3", "4", "5", "6", "7", "8", "9", "10", "0"], default="1")
 
         if choice == "1":
             console.clear()
@@ -976,6 +1254,27 @@ def interactive_menu():
                 run_watchdog(interval=10, once=False)
             Prompt.ask("\nTekan Enter untuk kembali ke menu utama")
 
+        elif choice == "10":
+            console.clear()
+            console.print(Rule("[bold cyan]VPN REST API CRM Menu[/bold cyan]"))
+            key_display = f"{API_KEY[:4]}***" if len(API_KEY) > 4 else (API_KEY if API_KEY else "[bold red]Belum diatur di .env[/bold red]")
+            console.print(f"[dim]Port: {API_PORT} | API Key: {key_display}[/dim]\n")
+            console.print("[1] ⚙️ Cek Status Service Systemd (vpn-api.service)")
+            console.print("[2] 🔄 Restart Service Systemd (vpn-api.service)")
+            console.print("[3] 🚀 Jalankan REST API Server di Terminal (Foreground)")
+            console.print("[4] 🧪 Test Local Request GET /api/users")
+            console.print("[0] Kembali ke Menu Utama")
+            sub_api = Prompt.ask("Pilih opsi", choices=["1", "2", "3", "4", "0"], default="1")
+            if sub_api == "1":
+                console.print(run_cmd("systemctl status vpn-api.service 2>/dev/null || true"))
+            elif sub_api == "2":
+                console.print(run_cmd("sudo systemctl restart vpn-api.service && systemctl status vpn-api.service --no-pager 2>/dev/null || true"))
+            elif sub_api == "3":
+                run_api_server(port=API_PORT, api_key=API_KEY)
+            elif sub_api == "4":
+                console.print(run_cmd(f"curl -s -H 'Authorization: Bearer {API_KEY}' http://127.0.0.1:{API_PORT}/api/users | json_pp 2>/dev/null || curl -s -H 'Authorization: Bearer {API_KEY}' http://127.0.0.1:{API_PORT}/api/users"))
+            Prompt.ask("\nTekan Enter untuk kembali ke menu utama")
+
         elif choice == "0":
             console.print("[bold green]Terima kasih! Keluar dari VPN CLI.[/bold green]")
             sys.exit(0)
@@ -1001,6 +1300,12 @@ def main():
     watchdog_p = subparsers.add_parser("watchdog", help="Jalankan daemon / check auto-kick user duplikat stuck")
     watchdog_p.add_argument("-i", "--interval", type=int, default=10, help="Interval loop watchdog dalam detik (default: 10)")
     watchdog_p.add_argument("--once", action="store_true", help="Jalankan pemeriksaan 1x lalu keluar")
+
+    # Subcommand: api
+    api_p = subparsers.add_parser("api", help="Jalankan REST API server untuk integrasi CRM")
+    api_p.add_argument("-p", "--port", type=int, default=API_PORT, help=f"Port REST API (default: {API_PORT})")
+    api_p.add_argument("--host", default="0.0.0.0", help="Host binding (default: 0.0.0.0)")
+    api_p.add_argument("--key", default=None, help="API Key (default: dari file .env)")
 
     # Subcommand: rate
     rate_p = subparsers.add_parser("rate", help="Kelola limitasi bandwidth (rate limits)")
@@ -1041,6 +1346,8 @@ def main():
         kick_user(args.target)
     elif args.command == "watchdog":
         run_watchdog(interval=args.interval, once=args.once)
+    elif args.command == "api":
+        run_api_server(host=args.host, port=args.port, api_key=args.key)
     elif args.command == "rate":
         limits = get_bandwidth_limits()
         if not args.rate_action or args.rate_action == "list":
@@ -1058,12 +1365,6 @@ def main():
             save_bandwidth_limits(limits)
             console.print("[bold green]✔ Default limit global diubah ke '%s'![/bold green]" % args.rate)
             apply_all_rate_limits_live()
-        elif args.command == "manage":
-            manage_containers(args.action, args.service)
-        elif args.command == "logs":
-            view_logs(service=args.service, follow=not args.no_follow, lines=args.lines)
-        elif args.command == "diag":
-            run_diagnostics()
     elif args.command == "manage":
         manage_containers(args.action, args.service)
     elif args.command == "logs":
